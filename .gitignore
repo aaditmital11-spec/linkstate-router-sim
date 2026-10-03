@@ -1,0 +1,6 @@
+router
+logs/
+__pycache__/
+*.pcap
+*.o
+.pytest_cache/
