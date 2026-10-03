@@ -393,30 +393,87 @@ open. Drop the `-w` to watch the HELLO and LSA messages scroll past live.
 The binary is built with `-g -O0`, so every variable is real and line numbers
 match the source exactly.
 
+First start the other routers, otherwise the one under the debugger has nobody
+to talk to and its database will only ever contain its own LSA:
+
+```sh
+for id in 2 3 4; do ./router $id topology.txt --run-for 120 >/dev/null & done
+```
+
+Then debug router 1:
+
 ```sh
 $ gdb ./router
 (gdb) break spf_compute
 (gdb) run 1
 (gdb) print dist
-(gdb) print prev
-(gdb) print *db
+```
+
+Note what `print dist` actually shows here. The breakpoint lands on the opening
+brace of `spf_compute`, which is *before* the loop that fills the arrays in, so
+at this point `dist` is whatever happened to be on the stack:
+
+```
+$1 = {540287026, 1862273585, -9544, 32767, 5, 0, 0, 0, ...}
+```
+
+That is uninitialised memory, not a bug. Step past the initialisation with
+`next` a few times and the array becomes meaningful. The two recipes below are
+more useful because they stop at a moment you actually care about.
+
+### Watch Dijkstra settle one router at a time
+
+`pick_closest_unvisited` is called once per iteration of the main loop, and its
+arguments are the live arrays. The condition waits until a route to router 2
+has been discovered, so the network has had time to converge:
+
+```sh
+(gdb) break pick_closest_unvisited if dist[2] != 2147483647
+(gdb) run 1
+(gdb) print *dist@17
+(gdb) print *visited@17
 (gdb) continue
 ```
 
-`break spf_compute` stops just as Dijkstra begins. Running with argument `1`
-starts the process as router 1. Once stopped, `print dist` shows the distance
-array indexed by router ID, which is where you can watch the algorithm settle
-one router at a time. `print prev` shows the predecessor chain the paths are
-reconstructed from.
+```
+$1 = {2147483647, 0, 1, 2147483647 <repeats 14 times>}
+$2 = {0, 1, 0 <repeats 15 times>}
+```
+
+`dist` and `visited` are pointers here rather than arrays, so `print *dist@17`
+is needed to print 17 elements starting at the pointer. Reading the output:
+slot 0 is unused, slot 1 is ourselves at distance 0 and already visited, and
+slot 2 is router 2 at distance 1, discovered but not yet settled. 2147483647 is
+`INT_MAX`, which is how "no path known yet" is represented. Each `continue`
+settles one more router.
+
+### Inspect a fully converged routing table
+
+Destination 4 is the furthest thing from router 1, so a non-infinite cost to it
+means everything has converged. `-1` is `SPF_INFINITE_COST`:
+
+```sh
+(gdb) break spf_print_table if t->routes[2].cost != -1
+(gdb) run 1
+(gdb) print t->routes[0]
+(gdb) print t->routes[1]
+(gdb) print t->routes[2]
+```
+
+```
+$1 = {dest = 2, next_hop = 2, cost = 1, path = {1, 2, 0 <repeats 15 times>}, path_len = 2}
+$2 = {dest = 3, next_hop = 2, cost = 2, path = {1, 2, 3, 0 <repeats 14 times>}, path_len = 3}
+$3 = {dest = 4, next_hop = 2, cost = 2, path = {1, 2, 4, 0 <repeats 14 times>}, path_len = 3}
+```
+
+`print *t` prints the whole table in one go, and `print *db` shows the
+link-state database the routes were computed from.
 
 Useful companions: `next` to step over a line, `step` to step into a call,
-`finish` to run to the end of the current function, and
-`watch dist[3]` to stop the moment the distance to router 3 changes.
+`finish` to run to the end of the current function, and `watch dist[3]` to stop
+the moment the distance to router 3 changes.
 
-Note that a single router started under gdb has no neighbors answering it, so
-its database will only contain its own LSA. To debug a converged network, start
-the other routers first with `./run.sh` or by hand, then attach to one with
-`gdb -p <pid>`.
+To debug a router that is already running, attach to it with `gdb -p <pid>`.
 
 ![gdb stopped in spf_compute](docs/gdb.png)
 
