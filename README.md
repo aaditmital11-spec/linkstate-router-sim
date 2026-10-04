@@ -1,4 +1,4 @@
-# linkstate-router-sim
+# Link-State Routing Simulator
 
 A link-state routing simulator in C. Each router is a separate Linux process. Routers exchange messages over UDP, discover the full network by flooding link-state advertisements, and compute shortest-path routing tables with Dijkstra's algorithm. When a router dies, the rest of the network detects it and reroutes.
 
