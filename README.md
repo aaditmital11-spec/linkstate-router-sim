@@ -76,7 +76,7 @@ A new LSA is sent every 5 s, and immediately whenever a neighbor goes UP or DOWN
 
 **Dijkstra.** O(N²) array-based SPF over up to 16 routers. Ties break toward the lower router ID, so output is deterministic. The table is reprinted only when it changes.
 
-**Forwarding.** Everything above is the control plane, which works out where things are. `DATA <src> <dst> <ttl> <payload>` is the data plane, which moves traffic. A router either delivers the packet (it is the destination), drops it (TTL exhausted, or no route), or decrements the TTL and sends it on to `spf_next_hop()`. That is a single lookup in an already computed table, which is the same division of labour real routers make.
+**Forwarding.** Everything above is the control plane, which works out where things are. `DATA <src> <dst> <ttl> <payload>` is the data plane, which moves traffic. A router either delivers the packet (it is the destination), drops it (TTL exhausted, or no route), or decrements the TTL and sends it on to `spf_next_hop()`.
 
 ### Source layout
 
@@ -168,5 +168,6 @@ $1 = {dest = 4, next_hop = 2, cost = 2, path = {1, 2, 4, 0 <repeats 14 times>}, 
 ## Limitations
 
 - Localhost only, up to 16 routers, addressed by port.
+- Destinations are sticky: a router that has been heard of once stays in the table as `unreachable` rather than vanishing when its LSA ages out.
 - No authentication or LSA acknowledgements (loopback doesn't drop packets, and periodic refresh covers gaps).
 - Link costs are static, read once at startup.
