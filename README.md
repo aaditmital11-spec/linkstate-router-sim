@@ -150,6 +150,10 @@ Open in Wireshark and filter with `udp contains "LSA"`. Frames 32 to 36 below sh
 
 ![Wireshark capture of LSA flooding](docs/wireshark.png)
 
+Filtering on `udp contains "DATA 1 3"` follows one packet from Router 1 to Router 3. It enters from netcat on a random port, R1 forwards it to R2, and R2 forwards it to R3, which delivers it. The TTL drops at each hop.
+
+![Wireshark capture of a data packet forwarded 1 to 2 to 3](docs/wireshark-data.png)
+
 ## Debugging with gdb
 
 Built with `-g -O0`. Start routers 2 to 4 first so Router 1 has neighbors, then stop on a fully converged table:
