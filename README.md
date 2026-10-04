@@ -150,9 +150,3 @@ $1 = {dest = 4, next_hop = 2, cost = 2, path = {1, 2, 4, 0 <repeats 14 times>}, 
 - Localhost only, up to 16 routers, addressed by port.
 - No authentication or LSA acknowledgements (loopback doesn't drop packets, and periodic refresh covers gaps).
 - Link costs are static, read once at startup.
-
-## Future work
-
-- Run each router on a separate Raspberry Pi over a real network.
-- Use Linux network namespaces so each router has its own network stack, and simulate failures by taking interfaces down.
-- Separate links onto VLANs.
