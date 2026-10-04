@@ -4,3 +4,6 @@ __pycache__/
 *.pcap
 *.o
 .pytest_cache/
+
+# Alternate data streams Windows attaches to files copied in over \\wsl$
+*:Zone.Identifier

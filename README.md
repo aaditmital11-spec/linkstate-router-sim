@@ -386,7 +386,12 @@ sudo tcpdump -i lo -nn -A udp portrange 5001-5004 -w docs/capture.pcap
 `-A` prints payloads as ASCII, and `-w` writes a pcap file that Wireshark can
 open. Drop the `-w` to watch the HELLO and LSA messages scroll past live.
 
-![Wireshark showing HELLO and LSA messages](docs/wireshark.png)
+Filtering with `udp contains "LSA"` in Wireshark isolates the link-state
+traffic from the much more numerous HELLOs. Expanding the `Data` field of any
+packet shows the message as readable text, for example `LSA 4 3 1 2:1`, with no
+dissector required.
+
+![Wireshark showing flooded LSAs on the loopback interface, with the message readable as ASCII in the Data field](docs/wireshark.png)
 
 ## Debugging with gdb
 
@@ -475,7 +480,7 @@ the moment the distance to router 3 changes.
 
 To debug a router that is already running, attach to it with `gdb -p <pid>`.
 
-![gdb stopped in spf_compute](docs/gdb.png)
+![gdb stopped on a fully converged routing table, showing each route's next hop, cost and reconstructed path](docs/gdb.png)
 
 ## Limitations
 
