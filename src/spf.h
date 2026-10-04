@@ -56,4 +56,15 @@ int spf_tables_equal(const struct routing_table *a, const struct routing_table *
 /* Print the table in the project's fixed column format. */
 void spf_print_table(const struct routing_table *t, FILE *out);
 
+/*
+ * The next hop toward dst, or -1 if dst is unreachable or absent from the
+ * table.
+ *
+ * This is the whole interface the data plane needs. Forwarding a packet is one
+ * lookup in an already computed table, which is exactly the split real routers
+ * make: the control plane works out the routes slowly and occasionally, the
+ * data plane just reads the answer.
+ */
+int spf_next_hop(const struct routing_table *t, int dst);
+
 #endif /* SPF_H */

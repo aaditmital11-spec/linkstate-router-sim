@@ -9,6 +9,7 @@ run means the whole system actually works, flooding and timers included.
 Only the Python standard library is used, besides pytest itself.
 """
 
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -23,6 +24,9 @@ TOPOLOGY = REPO_ROOT / "topology.txt"
 # Every router in the test network.
 ALL_ROUTERS = [1, 2, 3, 4]
 
+# Router N listens on 127.0.0.1:BASE_PORT+N, the same convention send.sh uses.
+BASE_PORT = 5000
+
 # How long to let the network settle before we trust a table. Convergence
 # needs one HELLO interval to bring links up plus a moment to flood the LSAs,
 # so a few seconds is plenty; 8 leaves generous margin on a loaded machine.
@@ -33,6 +37,16 @@ CONVERGE_SECONDS = 8
 # router's LSA to age out of everybody's database (15 s).
 FAILURE_RUN_SECONDS = 30
 FAILURE_KILL_AT_SECONDS = 8
+
+# How long to wait after killing a router before the survivors can be trusted
+# to have reconverged and stopped routing through it.
+RECONVERGE_SECONDS = 15
+
+# Long enough to converge, inject a packet, and let the logs flush.
+DATA_RUN_SECONDS = 14
+
+# Converge, kill the hub, reconverge, inject, flush.
+DATA_FAILURE_RUN_SECONDS = FAILURE_KILL_AT_SECONDS + RECONVERGE_SECONDS + 3
 
 # Expected tables once all four routers are up, as {dest: (next_hop, cost)}.
 #
@@ -118,6 +132,23 @@ def collect_output(procs, timeout):
         outputs[rid] = stdout
 
     return outputs
+
+
+def inject_data(at_router, src, dst, message, ttl=8):
+    """
+    Hand one DATA packet to a running router, which should then forward it.
+
+    This is what send.sh does, in Python rather than through netcat so the
+    tests do not depend on an external tool. Note that the packet arrives from
+    an ephemeral port belonging to no router, which is exactly why the router
+    must not apply its source-port check to DATA.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        packet = f"DATA {src} {dst} {ttl} {message}".encode()
+        sock.sendto(packet, ("127.0.0.1", BASE_PORT + at_router))
+    finally:
+        sock.close()
 
 
 def parse_final_table(output):
@@ -245,3 +276,65 @@ def test_router_failure():
             assert table[dest] == expected, (
                 f"router {rid} route to {dest} after the failure: "
                 f"expected {expected}, got {table[dest]}\n{outputs[rid]}")
+
+
+def test_data_forwarding():
+    """
+    A data packet injected at router 1 for router 3 must travel 1 to 2 to 3,
+    with each router making its own independent forwarding decision from its
+    own table. Nobody is told the path; each hop only knows its next hop.
+    """
+    procs = start_routers(ALL_ROUTERS, DATA_RUN_SECONDS)
+
+    time.sleep(CONVERGE_SECONDS)
+    inject_data(at_router=1, src=1, dst=3, message="hello world")
+
+    outputs = collect_output(procs, timeout=DATA_RUN_SECONDS + 30)
+
+    assert "forwarding DATA 1->3 via R2" in outputs[1], outputs[1]
+    assert "forwarding DATA 1->3 via R3" in outputs[2], outputs[2]
+    assert "delivered DATA from R1" in outputs[3], outputs[3]
+
+    # The payload must survive the trip intact, spaces included.
+    assert 'delivered DATA from R1: "hello world"' in outputs[3], outputs[3]
+
+
+def test_forwarding_after_failure():
+    """
+    Kill the hub and the data plane must follow the control plane onto the new
+    path. Router 1 originally forwards to router 3 through router 2; once
+    router 2 is gone it has to use its direct cost 5 link instead.
+    """
+    procs = start_routers(ALL_ROUTERS, DATA_FAILURE_RUN_SECONDS)
+
+    time.sleep(FAILURE_KILL_AT_SECONDS)
+    procs[2].kill()
+
+    time.sleep(RECONVERGE_SECONDS)
+    inject_data(at_router=1, src=1, dst=3, message="after the failure")
+
+    outputs = collect_output(procs, timeout=DATA_FAILURE_RUN_SECONDS + 30)
+
+    assert "forwarding DATA 1->3 via R3" in outputs[1], outputs[1]
+
+    # One hop now instead of two, so it should arrive directly.
+    assert "delivered DATA from R1" in outputs[3], outputs[3]
+
+
+def test_unreachable_dropped():
+    """
+    Router 4's only link was through router 2, so killing router 2 cuts it off
+    completely. A packet for router 4 must be dropped at router 1 with a clear
+    reason rather than being forwarded into a black hole.
+    """
+    procs = start_routers(ALL_ROUTERS, DATA_FAILURE_RUN_SECONDS)
+
+    time.sleep(FAILURE_KILL_AT_SECONDS)
+    procs[2].kill()
+
+    time.sleep(RECONVERGE_SECONDS)
+    inject_data(at_router=1, src=1, dst=4, message="nobody home")
+
+    outputs = collect_output(procs, timeout=DATA_FAILURE_RUN_SECONDS + 30)
+
+    assert "dropped DATA 1->4: no route" in outputs[1], outputs[1]

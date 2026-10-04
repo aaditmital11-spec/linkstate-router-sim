@@ -209,6 +209,26 @@ int spf_tables_equal(const struct routing_table *a, const struct routing_table *
     return 1;
 }
 
+int spf_next_hop(const struct routing_table *t, int dst)
+{
+    for (int i = 0; i < t->count; i++) {
+        if (t->routes[i].dest != dst) {
+            continue;
+        }
+
+        /* The row exists but has no path. We still return -1 rather than the
+         * stored next_hop, which is 0 for an unreachable destination. */
+        if (t->routes[i].cost == SPF_INFINITE_COST) {
+            return -1;
+        }
+
+        return t->routes[i].next_hop;
+    }
+
+    /* Not in the table at all: a router we have never heard of. */
+    return -1;
+}
+
 /*
  * Render a path as "1 -> 2 -> 3" into buf. Truncation is impossible given
  * PATH_STR_MAX and the 16 router limit, but the return value of snprintf is

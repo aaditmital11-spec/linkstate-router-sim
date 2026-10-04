@@ -11,6 +11,7 @@ A link-state routing simulator in C. Each router is a separate Linux process. Ro
 - **Routers learn the network themselves.** Each router reads only its own links from `topology.txt`. Everything beyond its neighbors arrives over the network.
 - **Picks the cheapest path, not the shortest hop count.** Router 1 reaches Router 3 through Router 2 (cost 2) instead of its direct link (cost 5).
 - **Handles failure.** Kill a router and the survivors detect the silence, re-flood their links, and reconverge within seconds.
+- **Forwards real packets.** Inject a message and watch it travel hop by hop, each router picking the next hop from its own table, with a TTL to stop loops.
 - **Single-threaded event loop.** One `poll()` loop handles all I/O and timers, with no threads and no blocking reads.
 - **End-to-end tests.** Real processes, real sockets, nothing mocked.
 
@@ -19,9 +20,10 @@ For the full design walkthrough (event loop, timer choices, flooding details, gd
 ## Quick start
 
 ```sh
-make          # builds ./router with zero warnings
-./run.sh      # starts routers 1 to 4, logs to logs/r<id>.log
-make test     # runs the pytest suite (~50 s)
+make                      # builds ./router with zero warnings
+./run.sh                  # starts routers 1 to 4, logs to logs/r<id>.log
+./send.sh 1 3 hello       # sends a data packet from Router 1 to Router 3
+make test                 # runs the pytest suite (~2 min)
 ```
 
 Run a single router:
@@ -74,14 +76,16 @@ A new LSA is sent every 5 s, and immediately whenever a neighbor goes UP or DOWN
 
 **Dijkstra.** O(N²) array-based SPF over up to 16 routers. Ties break toward the lower router ID, so output is deterministic. The table is reprinted only when it changes.
 
+**Forwarding.** Everything above is the control plane, which works out where things are. `DATA <src> <dst> <ttl> <payload>` is the data plane, which moves traffic. A router either delivers the packet (it is the destination), drops it (TTL exhausted, or no route), or decrements the TTL and sends it on to `spf_next_hop()`. That is a single lookup in an already computed table, which is the same division of labour real routers make.
+
 ### Source layout
 
 | File | Responsibility |
 | --- | --- |
-| `src/router.c` | `main`, UDP socket, `poll()` loop, timers, HELLO/LSA handling |
+| `src/router.c` | `main`, UDP socket, `poll()` loop, timers, HELLO/LSA/DATA handling |
 | `src/topology.c` | Parses the topology file, returns only this router's links |
 | `src/lsdb.c` | Link-state database: sequence numbers, aging, two-way check, flood decision |
-| `src/spf.c` | Dijkstra, routing table construction and printing |
+| `src/spf.c` | Dijkstra, routing table construction and printing, next-hop lookup |
 
 ## Example output
 
@@ -109,6 +113,20 @@ Destination   Next Hop   Cost   Path
 
 Router 1 falls back to its direct cost-5 link, and Router 4 is cut off since its only link was through Router 2.
 
+A message's journey from Router 1 to Router 3, read across three separate processes:
+
+```sh
+./send.sh 1 3 hello world
+```
+
+```
+[R1] forwarding DATA 1->3 via R2 (ttl 7)
+[R2] forwarding DATA 1->3 via R3 (ttl 6)
+[R3] delivered DATA from R1: "hello world" (ttl 6)
+```
+
+Three independent decisions. No router knows the whole path; each one only looks up its own next hop. Kill Router 2 and the same command produces `[R1] forwarding DATA 1->3 via R3`, because the data plane follows wherever the control plane has moved the route.
+
 ## Testing
 
 | Test | Checks |
@@ -116,6 +134,9 @@ Router 1 falls back to its direct cost-5 link, and Router 4 is cut off since its
 | `test_full_topology` | All four routers converge to the expected next hop and cost for every destination |
 | `test_dijkstra_beats_direct_link` | Router 1 reaches Router 3 via Router 2 at cost 2, not directly at cost 5 |
 | `test_router_failure` | After Router 2 is SIGKILLed, Routers 1 and 3 reroute over the cost-5 link and report Router 4 unreachable |
+| `test_data_forwarding` | A packet injected at Router 1 for Router 3 crosses 1 to 2 to 3 and arrives with its payload intact |
+| `test_forwarding_after_failure` | With Router 2 dead, Router 1 forwards to Router 3 over its direct link instead |
+| `test_unreachable_dropped` | A packet for the cut-off Router 4 is dropped at Router 1 with `no route` |
 
 SIGKILL is used so Router 2 dies without warning. The others must detect the failure purely from missing HELLOs.
 
@@ -146,7 +167,6 @@ $1 = {dest = 4, next_hop = 2, cost = 2, path = {1, 2, 4, 0 <repeats 14 times>}, 
 
 ## Limitations
 
-- Computes routes only; no data packets are actually forwarded.
 - Localhost only, up to 16 routers, addressed by port.
 - No authentication or LSA acknowledgements (loopback doesn't drop packets, and periodic refresh covers gaps).
 - Link costs are static, read once at startup.

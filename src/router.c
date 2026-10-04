@@ -62,6 +62,10 @@
  * never mistaken for a dead router; three refresh periods gives that margin. */
 #define LSA_MAX_AGE_MS 15000
 
+/* Largest time to live we accept on a data packet. Any sane value is far below
+ * this; the cap exists only so a malformed field cannot get through. */
+#define MAX_TTL 255
+
 /*
  * What we know about one directly connected neighbor. The id and cost come
  * from the topology file and never change. The up flag and last_hello_ms are
@@ -673,6 +677,119 @@ static void handle_lsa(struct router *r, char *saveptr, const char *raw,
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Data plane                                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Handle a received data packet:
+ *     DATA <src> <dst> <ttl> <payload>
+ * for example "DATA 1 3 8 hello world".
+ *
+ * Everything above this point is control plane: it works out where things are.
+ * This function is the data plane: given a packet, send it one hop closer. The
+ * only thing it needs from all that machinery is a single lookup in the most
+ * recently computed routing table, which is how the split works in real
+ * routers too.
+ *
+ * `saveptr` continues the tokenization that handle_message() began, positioned
+ * just after the DATA verb.
+ */
+static void handle_data(struct router *r, char *saveptr)
+{
+    char safe[MAX_MSG + 1];
+    char msg[MAX_MSG];
+    char *src_tok, *dst_tok, *ttl_tok, *payload;
+    int src, dst, ttl, next_hop;
+    size_t payload_len;
+
+    src_tok = strtok_r(NULL, " \t\r\n", &saveptr);
+    dst_tok = strtok_r(NULL, " \t\r\n", &saveptr);
+    ttl_tok = strtok_r(NULL, " \t\r\n", &saveptr);
+
+    if (src_tok == NULL || dst_tok == NULL || ttl_tok == NULL) {
+        printf("[R%d] ignoring DATA with missing header fields\n", r->id);
+        return;
+    }
+
+    if (!parse_int(src_tok, &src) || src < 1 || src > MAX_ROUTER_ID) {
+        printf("[R%d] ignoring DATA with bad source\n", r->id);
+        return;
+    }
+    if (!parse_int(dst_tok, &dst) || dst < 1 || dst > MAX_ROUTER_ID) {
+        printf("[R%d] ignoring DATA with bad destination\n", r->id);
+        return;
+    }
+    /* A ttl of 0 is legal to receive: it simply dies here. */
+    if (!parse_int(ttl_tok, &ttl) || ttl < 0 || ttl > MAX_TTL) {
+        printf("[R%d] ignoring DATA with bad ttl\n", r->id);
+        return;
+    }
+
+    /*
+     * The payload is everything left in the message, spaces included, so it is
+     * taken as the remainder of the buffer rather than as another token.
+     * strtok_r left saveptr just past the ttl token, so skip the separator.
+     * An empty payload is accepted: the payload is opaque to us, and only the
+     * header fields are worth rejecting a packet over.
+     */
+    payload = saveptr;
+    while (*payload == ' ' || *payload == '\t') {
+        payload++;
+    }
+
+    /* Trim a trailing newline, which a hand-typed or netcat-sent message may
+     * carry. Without this it would end up inside the forwarded payload. */
+    payload_len = strlen(payload);
+    while (payload_len > 0 &&
+           (payload[payload_len - 1] == '\n' || payload[payload_len - 1] == '\r')) {
+        payload[--payload_len] = '\0';
+    }
+
+    /* We are the destination: the packet has arrived. */
+    if (dst == r->id) {
+        /* The payload came off the network, so strip control characters out of
+         * it before logging. */
+        sanitize(payload, payload_len, safe, sizeof(safe));
+        printf("[R%d] delivered DATA from R%d: \"%s\" (ttl %d)\n",
+               r->id, src, safe, ttl);
+        return;
+    }
+
+    /*
+     * Out of hops. Forwarding would decrement the ttl to zero, so the packet
+     * dies here instead. This is the backstop against a packet circulating
+     * forever: during the brief window while a failure is still propagating,
+     * two routers can disagree about the next hop and bounce a packet between
+     * themselves, and the ttl is what eventually ends that.
+     */
+    if (ttl <= 1) {
+        printf("[R%d] dropped DATA %d->%d: ttl expired\n", r->id, src, dst);
+        return;
+    }
+
+    /* One lookup in the table the control plane has already computed. */
+    next_hop = spf_next_hop(&r->table, dst);
+    if (next_hop < 0) {
+        printf("[R%d] dropped DATA %d->%d: no route\n", r->id, src, dst);
+        return;
+    }
+
+    ttl--;
+
+    /* Rebuilding cannot overflow: only the ttl changed, and it got smaller. */
+    if (snprintf(msg, sizeof(msg), "DATA %d %d %d %s", src, dst, ttl, payload)
+            >= (int)sizeof(msg)) {
+        printf("[R%d] dropped DATA %d->%d: message too long to forward\n",
+               r->id, src, dst);
+        return;
+    }
+
+    send_to_router(r, next_hop, msg);
+    printf("[R%d] forwarding DATA %d->%d via R%d (ttl %d)\n",
+           r->id, src, dst, next_hop, ttl);
+}
+
 /*
  * Dispatch one received message. buf is NUL-terminated and owned by the
  * caller; we are free to tokenize it in place.
@@ -684,13 +801,6 @@ static void handle_message(struct router *r, char *buf, size_t len,
     char raw[MAX_MSG + 1];
     char *saveptr = NULL;
     char *verb;
-
-    if (from_id == 0) {
-        /* Source port is not a router port, so we cannot attribute the packet. */
-        sanitize(buf, len, safe, sizeof(safe));
-        printf("[R%d] ignoring message from unknown source port: \"%s\"\n", r->id, safe);
-        return;
-    }
 
     /*
      * Keep a pristine copy before tokenizing. strtok_r() writes NUL bytes into
@@ -704,7 +814,33 @@ static void handle_message(struct router *r, char *buf, size_t len,
      * on a hand-typed test message does not become part of a token. */
     verb = strtok_r(buf, " \t\r\n", &saveptr);
     if (verb == NULL) {
-        printf("[R%d] ignoring empty message from R%d\n", r->id, from_id);
+        printf("[R%d] ignoring empty message\n", r->id);
+        return;
+    }
+
+    /*
+     * DATA is checked before the source port, deliberately.
+     *
+     * A data packet is traffic, not a protocol message. It can legitimately be
+     * injected by anything, and send.sh uses netcat, which sends from an
+     * ephemeral port that corresponds to no router at all. The src and dst
+     * fields inside the message are what identify it, so there is nothing to
+     * match the port against.
+     */
+    if (strcmp(verb, "DATA") == 0) {
+        handle_data(r, saveptr);
+        return;
+    }
+
+    /*
+     * HELLO and LSA are control plane messages, and those we do attribute by
+     * source port, so that a stray packet cannot invent an adjacency or inject
+     * topology into the database.
+     */
+    if (from_id == 0) {
+        sanitize(raw, len, safe, sizeof(safe));
+        printf("[R%d] ignoring message from unknown source port: \"%.64s\"\n",
+               r->id, safe);
         return;
     }
 
